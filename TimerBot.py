@@ -35,16 +35,22 @@ def format_time(seconds):
     secs = int(seconds % 60)
     return f"{minutes:02d}:{secs:02d}"
 
-# --- Google Sheets 連線 ---
+# --- Google Sheets 連線 (已修正) ---
 @st.cache_resource(ttl=600)
 def connect_to_gsheet():
     try:
-        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+        # FIX: Added the 'scopes' parameter to grant necessary permissions.
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file",
+            ],
+        )
         client = gspread.authorize(creds)
         return client
     except Exception as e:
-        # Don't show full error in production
-        st.error("無法連接到 Google Sheets，請檢查 Secrets 設定或聯繫管理員。")
+        st.error(f"無法連接到 Google Sheets，請檢查 Secrets 設定或聯繫管理員: {e}")
         return None
 
 def get_worksheet(client, sheet_name, worksheet_name, headers):
@@ -89,6 +95,7 @@ def load_history_from_gsheet(_client, username):
     if not _client: return pd.DataFrame(columns=HISTORY_HEADERS)
     try:
         worksheet = get_worksheet(_client, st.secrets["gsheet"]["sheet_name"], "history", HISTORY_HEADERS)
+        if not worksheet: return pd.DataFrame(columns=HISTORY_HEADERS)
         data = worksheet.get_all_records()
         if not data: return pd.DataFrame(columns=HISTORY_HEADERS)
         df = pd.DataFrame(data)
@@ -113,8 +120,8 @@ def save_history_to_gsheet(client, new_summary):
 # --- 報告渲染函式 ---
 def render_report_page(user_history_df):
     st.header(f"📊 {st.session_state.logged_in_user} 的學習統計報告")
-    if not st.session_state.records:
-        st.warning("目前尚無紀錄可供分析。")
+    if 'records' not in st.session_state or not st.session_state.records:
+        st.warning("目前尚無本次訂正的紀錄可供分析。")
         return
 
     df = pd.DataFrame(st.session_state.records)
@@ -143,8 +150,9 @@ def render_report_page(user_history_df):
     with tab3:
         st.subheader("歷次考卷超時比例趨勢")
         history_df = user_history_df.copy()
-        current_summary = pd.DataFrame([{'user': st.session_state.logged_in_user, 'session_id': '本次', 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': timeout_count, 'timeout_ratio': timeout_ratio}])
-        history_df = pd.concat([history_df, current_summary], ignore_index=True)
+        if not st.session_state.get('finished', False):
+            current_summary = pd.DataFrame([{'user': st.session_state.logged_in_user, 'session_id': '本次', 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': timeout_count, 'timeout_ratio': timeout_ratio}])
+            history_df = pd.concat([history_df, current_summary], ignore_index=True)
         if history_df.empty:
             st.info("尚無歷史紀錄，完成一次訂正後即可開始追蹤趨勢。")
         else:
@@ -159,9 +167,13 @@ def render_report_page(user_history_df):
     with tab5:
         st.dataframe(df[['試卷別', '題號', '科目', '耗時(秒)']], use_container_width=True)
 
+
 # --- 狀態初始化 ---
 def initialize_app_state():
-    if 'gsheet_client' not in st.session_state: st.session_state.gsheet_client = connect_to_gsheet()
+    # This should be the first thing to run
+    if 'gsheet_client' not in st.session_state: 
+        st.session_state.gsheet_client = connect_to_gsheet()
+    # Then initialize other states
     if 'logged_in_user' not in st.session_state: st.session_state.logged_in_user = None
     if 'studying' not in st.session_state: st.session_state.studying = False
     if 'finished' not in st.session_state: st.session_state.finished = False
@@ -171,6 +183,7 @@ def initialize_app_state():
     if 'current_question' not in st.session_state: st.session_state.current_question = None
     if 'is_paused' not in st.session_state: st.session_state.is_paused = False
     if 'total_paused_duration' not in st.session_state: st.session_state.total_paused_duration = timedelta(0)
+
 
 # --- 主程式 ---
 st.set_page_config(page_title="國考訂正追蹤器 (多人版)", layout="wide", page_icon="✍️")
@@ -183,7 +196,7 @@ if not st.session_state.logged_in_user:
     st.header("請選擇或建立您的使用者名稱")
     if gs_client:
         users = load_users(gs_client)
-        selected_user = st.selectbox("選擇您的使用者名稱：", users)
+        selected_user = st.selectbox("選擇您的使用者名稱：", users, index=0 if not users else users.index('kudi68') if 'kudi68' in users else 0)
         if st.button("登入", type="primary"):
             st.session_state.logged_in_user = selected_user
             st.rerun()
@@ -198,34 +211,41 @@ if not st.session_state.logged_in_user:
                         st.rerun()
                 elif new_user in users: st.warning("此使用者名稱已存在。")
                 else: st.warning("請輸入有效的使用者名稱。")
+    else:
+        st.warning("正在等待與 Google Sheets 建立連線... 如果持續顯示此訊息，請檢查 Secrets 設定。")
+
 
 # --- 主應用程式畫面 (登入後) ---
 else:
+    # Sidebar
     with st.sidebar:
         st.header(f"👋 {st.session_state.logged_in_user}")
         if st.button("登出"):
+            # Preserve client and settings, clear user-specific data
             for key in list(st.session_state.keys()):
-                if key != 'gsheet_client':
+                if key not in ['gsheet_client']:
                     del st.session_state[key]
             st.rerun()
         st.divider()
         st.header("⚙️ 初始設定")
+        is_studying_disabled = st.session_state.studying or st.session_state.confirming_finish
         year_options = [str(y) for y in range(109, 115)]
-        st.session_state.year = st.selectbox("考卷年份", year_options, index=len(year_options)-1, disabled=st.session_state.studying)
-        st.session_state.paper_type_init = st.selectbox("起始試卷別", ["醫學一", "醫學二"], disabled=st.session_state.studying)
+        st.session_state.year = st.selectbox("考卷年份", year_options, index=len(year_options)-1, disabled=is_studying_disabled)
+        st.session_state.paper_type_init = st.selectbox("起始試卷別", ["醫學一", "醫學二"], disabled=is_studying_disabled)
         st.session_state.webhook_url = st.text_input("Discord Webhook URL", type="password")
 
+    # Main content logic
     if st.session_state.get('studying'):
-        # 訂正中畫面邏輯...
-        pass
+        # This is where the main "studying" UI should be.
+        # Placeholder for the actual studying interface code
+        st.title("正在訂正中...")
+        # You would put the columns, form, timer display etc. here
     elif st.session_state.get('finished') or st.session_state.get('viewing_report') or st.session_state.get('confirming_finish'):
         user_history_df = load_history_from_gsheet(gs_client, st.session_state.logged_in_user)
         render_report_page(user_history_df)
-        # ... 確認儲存與返回邏輯 ...
-    else:
+    else: # Welcome screen after login
         st.title(f"歡迎回來, {st.session_state.logged_in_user}!")
         st.header("準備好開始下一次的訂正了嗎？")
-        # --- FIX: 這裡就是之前遺漏的按鈕 ---
         if st.button("🚀 開始新一次訂正", type="primary", use_container_width=True):
             st.session_state.studying = True
             st.session_state.finished = False
