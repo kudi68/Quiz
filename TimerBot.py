@@ -104,7 +104,7 @@ def save_history_to_gsheet(client, new_summary):
     except Exception:
         return False
 
-# --- 報告渲染函式 (完整版) ---
+# --- 報告渲染函式 ---
 def render_report_page(user_history_df, is_connected):
     st.header(f"📊 {st.session_state.logged_in_user} 的學習統計報告")
     if 'records' not in st.session_state or not st.session_state.records:
@@ -183,7 +183,7 @@ def handle_pause_resume():
         st.session_state.is_paused = True
 
 # --- 主程式 ---
-st.set_page_config(page_title="國考訂正追蹤器 v7.0", layout="wide", page_icon="✍️")
+st.set_page_config(page_title="國考訂正追蹤器 v8.0", layout="wide", page_icon="✍️")
 initialize_app_state()
 
 if 'gsheet_client' not in st.session_state or st.session_state.gsheet_client is None:
@@ -231,6 +231,11 @@ else:
         st.header("🔔 Discord 設定")
         st.session_state.webhook_url = st.text_input("您的 Webhook 網址", value=st.session_state.webhook_url, help="此設定僅於本次登入有效。")
         st.divider()
+        # FIX: Re-added the custom timer settings
+        st.header("⏱️ 提醒設定")
+        st.session_state.initial_timeout = st.number_input("首次超時提醒 (秒)", min_value=10, value=st.session_state.initial_timeout, step=5)
+        st.session_state.snooze_interval = st.number_input("後續提醒間隔 (秒)", min_value=10, value=st.session_state.snooze_interval, step=5)
+        st.divider()
         st.header("⚙️ 初始設定")
         disabled_state = st.session_state.studying or st.session_state.confirming_finish
         st.session_state.year = st.selectbox("考卷年份", [str(y) for y in range(109, 115)], index=5, disabled=disabled_state)
@@ -256,7 +261,7 @@ else:
                     if st.session_state.is_paused: st.session_state.total_paused_duration += (end_time - st.session_state.pause_start_time)
                     duration_sec = (end_time - st.session_state.current_question['start_time'] - st.session_state.total_paused_duration).total_seconds()
                     st.session_state.records.append({"年份": st.session_state.year, "試卷別": st.session_state.paper_type, "題號": st.session_state.current_question['q_num'], "科目": get_subject(st.session_state.paper_type, st.session_state.current_question['q_num']), "耗時(秒)": int(duration_sec), "是否超時": duration_sec > st.session_state.initial_timeout})
-                st.session_state.current_question = {"q_num": q_num_input, "start_time": datetime.now(), "next_notification_time": datetime.now() + timedelta(seconds=st.session_state.initial_timeout)}
+                st.session_state.current_question = {"q_num": q_num_input, "start_time": datetime.now(), "notified": False, "next_notification_time": datetime.now() + timedelta(seconds=st.session_state.initial_timeout)}
                 st.session_state.is_paused = False; st.session_state.total_paused_duration = timedelta(0)
                 st.rerun()
             pause_button_text = "▶️ 繼續" if st.session_state.is_paused else "⏸️ 暫停"
@@ -265,13 +270,17 @@ else:
             st.header("📊 即時狀態")
             if st.session_state.current_question:
                 q_info = st.session_state.current_question
-                if st.session_state.is_paused:
-                    elapsed_duration = st.session_state.pause_start_time - q_info['start_time'] - st.session_state.total_paused_duration
-                    st.metric("即時訂正時間 (已暫停)", format_time(elapsed_duration.total_seconds()))
-                else:
-                    elapsed_duration = datetime.now() - q_info['start_time'] - st.session_state.total_paused_duration
-                    st.metric("即時訂正時間", format_time(elapsed_duration.total_seconds()))
+                elapsed_duration = (datetime.now() - q_info['start_time'] - st.session_state.total_paused_duration) if not st.session_state.is_paused else (st.session_state.pause_start_time - q_info['start_time'] - st.session_state.total_paused_duration)
+                st.metric("即時訂正時間", format_time(elapsed_duration.total_seconds()))
                 st.metric(f"目前題號：{q_info['q_num']}", f"科目：{get_subject(st.session_state.paper_type, q_info['q_num'])}")
+                
+                # FIX: Re-added timeout notification logic
+                if not st.session_state.is_paused and datetime.now() > q_info.get('next_notification_time', datetime.now() + timedelta(days=1)):
+                    embed = {"title": "🚨 訂正超時提醒 🚨", "description": f"**題號 {q_info['q_num']}** ({get_subject(st.session_state.paper_type, q_info['q_num'])}) 的訂正時間已超過 **{format_time(elapsed_duration.total_seconds())}**！"}
+                    send_discord_notification(st.session_state.webhook_url, embed)
+                    st.toast(f"🔔 題號 {q_info['q_num']} 已超時，發送 Discord 提醒！")
+                    st.session_state.current_question['next_notification_time'] = datetime.now() + timedelta(seconds=st.session_state.snooze_interval)
+                
                 st.markdown("---"); st.write("**延後提醒**")
                 snooze_cols = st.columns(3)
                 snooze_cols[0].button("1分鐘", on_click=snooze, args=(1,), use_container_width=True)
@@ -285,27 +294,31 @@ else:
         if gs_client: history_df = load_history_from_gsheet(gs_client, st.session_state.logged_in_user)
         render_report_page(history_df, is_connected=(gs_client is not None))
         
-        # --- FIX: Added action buttons at the bottom of the report page ---
         if st.session_state.viewing_report:
             if st.button("⬅️ 返回繼續訂正"):
-                st.session_state.viewing_report = False
-                st.rerun()
+                st.session_state.viewing_report = False; st.rerun()
         elif st.session_state.confirming_finish:
             st.warning("您即將結束本次訂正，請確認數據是否正確。")
             c1, c2 = st.columns(2)
             if c1.button("💾 確認儲存並結束", type="primary"):
-                if gs_client:
+                if st.session_state.records:
                     df = pd.DataFrame(st.session_state.records)
                     timeout_count = df['是否超時'].sum(); total_count = len(df)
+                    avg_time_sec = df['耗時(秒)'].mean()
                     timeout_ratio = (timeout_count / total_count) * 100 if total_count > 0 else 0
-                    new_summary = {'user': st.session_state.logged_in_user, 'session_id': datetime.now().strftime('%Y%m%d%H%M%S'), 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': timeout_count, 'timeout_ratio': timeout_ratio}
-                    if save_history_to_gsheet(gs_client, new_summary): st.toast("紀錄已儲存至雲端！")
-                    else: st.toast("⚠️ 無法儲存紀錄至雲端。")
-                st.session_state.confirming_finish = False; st.session_state.finished = True
-                st.rerun()
+                    
+                    # FIX: Re-added completion notification
+                    completion_embed = {"title": f"✅ {st.session_state.year} 年考卷訂正完成！", "color": 3066993, "fields": [{"name": "總訂正題數", "value": f"{total_count} 題", "inline": True}, {"name": "平均每題耗時", "value": f"{avg_time_sec:.1f} 秒", "inline": True}, {"name": "超時比例", "value": f"{timeout_ratio:.1f}%", "inline": True}]}
+                    send_discord_notification(st.session_state.webhook_url, completion_embed)
+
+                    if gs_client:
+                        new_summary = {'user': st.session_state.logged_in_user, 'session_id': datetime.now().strftime('%Y%m%d%H%M%S'), 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': int(timeout_count), 'timeout_ratio': timeout_ratio}
+                        if save_history_to_gsheet(gs_client, new_summary): st.toast("紀錄已儲存至雲端！")
+                        else: st.toast("⚠️ 無法儲存紀錄至雲端。")
+                
+                st.session_state.confirming_finish = False; st.session_state.finished = True; st.rerun()
             if c2.button("❌ 取消"):
-                st.session_state.confirming_finish = False; st.session_state.studying = True
-                st.rerun()
+                st.session_state.confirming_finish = False; st.session_state.studying = True; st.rerun()
 
     else:
         st.title(f"歡迎回來, {st.session_state.logged_in_user}!")
