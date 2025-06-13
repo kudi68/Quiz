@@ -109,7 +109,7 @@ def save_history_to_gsheet(client, new_summary):
         return True
     except Exception: return False
 
-# --- 報告渲染函式 ---
+# --- 報告渲染函式 (完整版) ---
 def render_report_page(user_history_df, is_connected):
     st.header(f"📊 {st.session_state.logged_in_user} 的學習統計報告")
     if not st.session_state.records: st.warning("目前尚無本次訂正的紀錄可供分析。"); return
@@ -124,7 +124,32 @@ def render_report_page(user_history_df, is_connected):
     st.success(f"**本次共完成 {total_count} 題，總耗時 {format_time(total_time_sec)}，平均每題 {avg_time_sec:.1f} 秒，超時比例 {timeout_ratio:.1f}%。**")
     
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 各科平均耗時", "🕒 各科時間佔比", "📉 超時歷史趨勢", "⚠️ 超時清單", "📋 詳細紀錄"])
-    # (Tabs content remains the same)
+    with tab1:
+        analysis = df.groupby('科目')['耗時(秒)'].agg(['count', 'mean']).reset_index()
+        analysis.columns = ['科目', '訂正題數', '平均耗時(秒)']
+        analysis['平均耗時(秒)'] = analysis['平均耗時(秒)'].round(1)
+        fig_bar = px.bar(analysis, x='科目', y='平均耗時(秒)', text='平均耗時(秒)', color='訂正題數')
+        st.plotly_chart(fig_bar, use_container_width=True)
+    with tab2:
+        time_dist = df.groupby('科目')['耗時(秒)'].sum().reset_index()
+        fig_pie = px.pie(time_dist, values='耗時(秒)', names='科目', title='各科目時間分配', hole=.3)
+        st.plotly_chart(fig_pie, use_container_width=True)
+    with tab3:
+        st.subheader("歷次考卷超時比例趨勢")
+        if not is_connected: st.warning("無法連接至雲端，歷史趨勢圖暫時無法顯示。")
+        else:
+            history_df = user_history_df.copy()
+            if not st.session_state.get('finished', False):
+                current_summary = pd.DataFrame([{'user': st.session_state.logged_in_user, 'session_id': '本次', 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': int(timeout_count), 'timeout_ratio': timeout_ratio}])
+                if not history_df.empty: history_df = pd.concat([history_df, current_summary], ignore_index=True)
+                else: history_df = current_summary
+            if not history_df.empty:
+                history_df['session_label'] = history_df['year'].astype(str) + '-' + history_df['paper_type']
+                fig_line = px.line(history_df, x='session_label', y='timeout_ratio', title='超時比例變化', markers=True)
+                st.plotly_chart(fig_line, use_container_width=True)
+            else: st.info("尚無歷史紀錄。")
+    with tab4: st.dataframe(df[df['是否超時'] == True])
+    with tab5: st.dataframe(df)
 
 # --- 狀態處理函式 ---
 def initialize_app_state():
@@ -155,20 +180,21 @@ def process_question_transition(next_q_num):
     st.session_state.is_paused = False
     st.session_state.total_paused_duration = timedelta(0)
     st.session_state.last_question_num = next_q_num
-    st.session_state.q_num_input = next_q_num + 1 if next_q_num < 100 else 1
+    # This key is intentionally different from the widget key to avoid the API error
+    st.session_state.q_num_display_value = next_q_num + 1 if next_q_num < 100 else 1
+
 
 # --- 主程式 ---
-st.set_page_config(page_title="國考訂正追蹤器 v12.0", layout="wide", page_icon="✍️")
+st.set_page_config(page_title="國考訂正追蹤器 v13.0", layout="wide", page_icon="✍️")
 initialize_app_state()
 
-if st.session_state.gsheet_client is None:
+if 'gsheet_client' not in st.session_state or st.session_state.gsheet_client is None:
     client = connect_to_gsheet()
     if client: st.session_state.gsheet_client = client; st.session_state.gsheet_connection_status = "✅ 歷史紀錄已同步"
     else: st.session_state.gsheet_connection_status = "⚠️ 無法同步歷史紀錄"
 gs_client = st.session_state.gsheet_client
 
 if not st.session_state.logged_in_user:
-    # 登入畫面邏輯 (完整版)
     st.title("歡迎使用國考高效訂正追蹤器")
     st.header("請選擇或建立您的使用者名稱")
     user_data = {"kudi68": {"username": "kudi68", "webhook_url": ""}}
@@ -227,20 +253,23 @@ else:
         main_col, stats_col = st.columns([2, 1.2])
         with main_col:
             st.header("📝 訂正進行中"); st.subheader(f"目前試卷：**{st.session_state.year} 年 - {st.session_state.paper_type}**")
+            
+            # FIX: Using st.form_submit_button to avoid callback issues with number_input
             with st.form("question_input_form"):
-                st.number_input("輸入題號 (1-100)", key="q_num_input")
+                q_num = st.number_input("輸入題號 (1-100)", min_value=1, max_value=100, step=1, format="%d", key="q_num_input")
                 c1, c2 = st.columns(2)
                 submitted_confirm = c1.form_submit_button("✔️ 確認", use_container_width=True)
                 submitted_next = c2.form_submit_button("➡️ 下一題", use_container_width=True, disabled=(st.session_state.current_question is None))
+
             if submitted_confirm:
-                process_question_transition(st.session_state.q_num_input); st.rerun()
+                process_question_transition(q_num); st.rerun()
             if submitted_next:
                 next_q_num = st.session_state.current_question['q_num'] + 1
                 process_question_transition(next_q_num); st.rerun()
+
             pause_button_text = "▶️ 繼續" if st.session_state.is_paused else "⏸️ 暫停"
             st.button(pause_button_text, on_click=handle_pause_resume, use_container_width=True, disabled=(st.session_state.current_question is None))
         with stats_col:
-            # 訂正中即時狀態 UI (完整版)
             st.header("📊 即時狀態")
             if st.session_state.current_question:
                 q_info = st.session_state.current_question
@@ -250,8 +279,7 @@ else:
                 if not st.session_state.is_paused and not q_info.get('notified', False) and datetime.now() > q_info.get('next_notification_time', datetime.now() + timedelta(days=1)):
                     embed = {"title": "🚨 訂正超時提醒 🚨", "description": f"**題號 {q_info['q_num']}** ({get_subject(st.session_state.paper_type, q_info['q_num'])}) 的訂正時間已超過 **{format_time(elapsed_duration.total_seconds())}**！"}
                     send_discord_notification(st.session_state.webhook_url, embed)
-                    st.toast(f"🔔 題號 {q_info['q_num']} 已超時，發送 Discord 提醒！")
-                    st.session_state.current_question['notified'] = True
+                    st.toast(f"🔔 題號 {q_info['q_num']} 已超時！"); st.session_state.current_question['notified'] = True
                     st.session_state.current_question['next_notification_time'] = datetime.now() + timedelta(seconds=st.session_state.snooze_interval)
                 st.markdown("---"); st.write("**延後提醒**")
                 snooze_cols = st.columns(3)
@@ -274,13 +302,18 @@ else:
             if c1.button("💾 確認儲存並結束", type="primary"):
                 if st.session_state.records:
                     if gs_client:
-                        # ... 保存邏輯 ...
-                        pass
+                        df = pd.DataFrame(st.session_state.records)
+                        timeout_count = df['是否超時'].sum(); total_count = len(df); avg_time_sec = df['耗時(秒)'].mean()
+                        timeout_ratio = (timeout_count / total_count) * 100 if total_count > 0 else 0
+                        completion_embed = {"title": f"✅ {st.session_state.year} 年考卷訂正完成！", "color": 3066993, "fields": [{"name": "總訂正題數", "value": f"{total_count} 題", "inline": True}, {"name": "平均每題耗時", "value": f"{avg_time_sec:.1f} 秒", "inline": True}, {"name": "超時比例", "value": f"{timeout_ratio:.1f}%", "inline": True}]}
+                        send_discord_notification(st.session_state.webhook_url, completion_embed)
+                        new_summary = {'user': st.session_state.logged_in_user, 'session_id': datetime.now().strftime('%Y%m%d%H%M%S'), 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': int(timeout_count), 'timeout_ratio': timeout_ratio}
+                        if save_history_to_gsheet(gs_client, new_summary): st.toast("紀錄已儲存至雲端！")
+                        else: st.toast("⚠️ 無法儲存紀錄至雲端。")
                 st.session_state.confirming_finish = False; st.session_state.finished = True; st.rerun()
             if c2.button("❌ 取消"):
                 st.session_state.confirming_finish = False; st.session_state.studying = True; st.rerun()
     else:
-        # 歡迎畫面 (完整版)
         st.title(f"歡迎回來, {st.session_state.logged_in_user}!")
         st.header("準備好開始下一次的訂正了嗎？")
         if st.button("🚀 開始新一次訂正", type="primary", use_container_width=True):
