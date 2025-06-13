@@ -235,7 +235,42 @@ else:
 
     elif st.session_state.studying and not st.session_state.viewing_report and not st.session_state.confirming_finish:
         # 訂正中 UI ...
-        pass
+        main_col, stats_col = st.columns([2, 1.2])
+        with main_col:
+            st.header("📝 訂正進行中"); st.subheader(f"目前試卷：**{st.session_state.year} 年 - {st.session_state.paper_type}**")
+            with st.form("question_input_form"):
+                q_num = st.number_input("輸入題號 (1-100)", min_value=1, max_value=100, step=1, format="%d", key="q_num_input")
+                c1, c2 = st.columns(2)
+                submitted_confirm = c1.form_submit_button("✔️ 確認", use_container_width=True)
+                submitted_next = c2.form_submit_button("➡️ 下一題", use_container_width=True, disabled=(st.session_state.current_question is None))
+
+            if submitted_confirm:
+                process_question_transition(q_num); st.rerun()
+            if submitted_next:
+                next_q_num = st.session_state.current_question['q_num'] + 1
+                process_question_transition(next_q_num); st.rerun()
+
+            pause_button_text = "▶️ 繼續" if st.session_state.is_paused else "⏸️ 暫停"
+            st.button(pause_button_text, on_click=handle_pause_resume, use_container_width=True, disabled=(st.session_state.current_question is None))
+        with stats_col:
+            st.header("📊 即時狀態")
+            if st.session_state.current_question:
+                q_info = st.session_state.current_question
+                elapsed_duration = (datetime.now() - q_info['start_time'] - st.session_state.total_paused_duration) if not st.session_state.is_paused else (st.session_state.pause_start_time - q_info['start_time'] - st.session_state.total_paused_duration)
+                st.metric("即時訂正時間", format_time(elapsed_duration.total_seconds()))
+                st.metric(f"目前題號：{q_info['q_num']}", f"科目：{get_subject(st.session_state.paper_type, q_info['q_num'])}")
+                if not st.session_state.is_paused and not q_info.get('notified', False) and datetime.now() > q_info.get('next_notification_time', datetime.now() + timedelta(days=1)):
+                    embed = {"title": "🚨 訂正超時提醒 🚨", "description": f"**題號 {q_info['q_num']}** ({get_subject(st.session_state.paper_type, q_info['q_num'])}) 的訂正時間已超過 **{format_time(elapsed_duration.total_seconds())}**！"}
+                    send_discord_notification(st.session_state.webhook_url, embed)
+                    st.toast(f"🔔 題號 {q_info['q_num']} 已超時！"); st.session_state.current_question['notified'] = True
+                    st.session_state.current_question['next_notification_time'] = datetime.now() + timedelta(seconds=st.session_state.snooze_interval)
+                st.markdown("---"); st.write("**延後提醒**")
+                snooze_cols = st.columns(3)
+                snooze_cols[0].button("1分鐘", on_click=snooze, args=(1,), use_container_width=True)
+                snooze_cols[1].button("2分鐘", on_click=snooze, args=(2,), use_container_width=True)
+                snooze_cols[2].button("5分鐘", on_click=snooze, args=(5,), use_container_width=True)
+            else:
+                st.info("請輸入第一題題號，點擊「✔️ 確認」後開始計時。")
     elif st.session_state.finished or st.session_state.viewing_report or st.session_state.confirming_finish:
         history_df = pd.DataFrame()
         if gs_client: history_df = load_history_from_gsheet(gs_client, st.session_state.logged_in_user)
@@ -245,7 +280,13 @@ else:
             if st.button("⬅️ 返回繼續訂正"): st.session_state.viewing_report = False; st.rerun()
         elif st.session_state.confirming_finish:
             # 確認儲存 UI ...
-            pass
+            st.warning("您即將結束本次訂正，請確認數據是否正確。")
+            c1, c2 = st.columns(2)
+            if c1.button("💾 確認儲存並結束", type="primary"):
+                save_current_session(is_connected=(gs_client is not None), client=gs_client)
+                st.session_state.confirming_finish = False; st.session_state.finished = True; st.rerun()
+            if c2.button("❌ 取消"):
+                st.session_state.confirming_finish = False; st.session_state.studying = True; st.rerun()
         elif st.session_state.finished:
             # FIX: Added button to go back to welcome screen after finishing a session
             if st.button("✔️ 關閉報告並返回主畫面"):
@@ -265,6 +306,3 @@ else:
             st.session_state.active_year = st.session_state.year
             st.session_state.active_paper_type = st.session_state.paper_type_init
             st.rerun()
-
-    if st.session_state.studying and st.session_state.current_question and not st.session_state.is_paused:
-        time.sleep(1); st.rerun()
