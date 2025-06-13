@@ -39,7 +39,6 @@ def connect_to_gsheet():
         )
         return gspread.authorize(creds)
     except Exception:
-        # 在這裡不顯示錯誤，讓主程式來處理
         return None
 
 def get_worksheet(client, sheet_name, worksheet_name, headers):
@@ -59,7 +58,7 @@ def load_users(_client):
         users = worksheet.col_values(1)[1:]
         return users if users else ["kudi68"]
     except Exception:
-        return None # 連線失敗時返回 None
+        return None
 
 def add_user(client, new_user):
     try:
@@ -97,13 +96,44 @@ def save_history_to_gsheet(client, new_summary):
 # --- 報告渲染函式 ---
 def render_report_page(user_history_df, is_connected):
     st.header(f"📊 {st.session_state.logged_in_user} 的學習統計報告")
-    # ... 其餘報告渲染邏輯 ...
-    with st.tabs(["..."])[2]: # 歷史趨勢圖
+    if 'records' not in st.session_state or not st.session_state.records:
+        st.warning("目前尚無本次訂正的紀錄可供分析。")
+        return
+    df = pd.DataFrame(st.session_state.records)
+    total_time_sec = df['耗時(秒)'].sum()
+    avg_time_sec = df['耗時(秒)'].mean()
+    timeout_count = df['是否超時'].sum()
+    total_count = len(df)
+    timeout_ratio = (timeout_count / total_count) * 100 if total_count > 0 else 0
+
+    st.success(f"**本次共完成 {total_count} 題，總耗時 {format_time(total_time_sec)}，平均每題 {avg_time_sec:.1f} 秒，超時比例 {timeout_ratio:.1f}%。**")
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 各科平均耗時", "🕒 各科時間佔比", "📉 超時歷史趨勢", "⚠️ 超時清單", "📋 詳細紀錄"])
+
+    with tab1:
+        analysis = df.groupby('科目')['耗時(秒)'].agg(['count', 'mean']).reset_index()
+        analysis.columns = ['科目', '訂正題數', '平均耗時(秒)']
+        analysis['平均耗時(秒)'] = analysis['平均耗時(秒)'].round(1)
+        fig_bar = px.bar(analysis, x='科目', y='平均耗時(秒)', text='平均耗時(秒)', color='訂正題數')
+        st.plotly_chart(fig_bar, use_container_width=True)
+    with tab2:
+        time_dist = df.groupby('科目')['耗時(秒)'].sum().reset_index()
+        fig_pie = px.pie(time_dist, values='耗時(秒)', names='科目', title='各科目時間分配', hole=.3)
+        st.plotly_chart(fig_pie, use_container_width=True)
+    with tab3:
         if not is_connected:
             st.warning("無法連接至雲端，歷史趨勢圖暫時無法顯示。")
         else:
-            # 繪製圖表邏輯
-            pass
+            history_df = user_history_df.copy()
+            current_summary = pd.DataFrame([{'user': st.session_state.logged_in_user, 'session_id': '本次', 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': timeout_count, 'timeout_ratio': timeout_ratio}])
+            history_df = pd.concat([history_df, current_summary], ignore_index=True)
+            history_df['session_label'] = history_df['year'].astype(str) + '-' + history_df['paper_type']
+            fig_line = px.line(history_df, x='session_label', y='timeout_ratio', title='超時比例變化', markers=True)
+            st.plotly_chart(fig_line, use_container_width=True)
+    with tab4:
+        st.dataframe(df[df['是否超時'] == True])
+    with tab5:
+        st.dataframe(df)
 
 # --- 狀態初始化 ---
 def initialize_app_state():
@@ -112,43 +142,44 @@ def initialize_app_state():
         'finished': False, 'confirming_finish': False, 'viewing_report': False,
         'records': [], 'current_question': None, 'is_paused': False,
         'total_paused_duration': timedelta(0), 'paper_type_init': "醫學一",
-        'year': "114", 'gsheet_connection_status': "未連接"
+        'year': "114", 'gsheet_connection_status': "未連接", 'last_question_num': 0,
+        'webhook_url': "", 'initial_timeout': 120, 'snooze_interval': 60
     }
     for key, default_value in keys_to_init.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
 
+def snooze(minutes: int):
+    if st.session_state.current_question:
+        snooze_until = datetime.now() + timedelta(minutes=minutes)
+        st.session_state.current_question['next_notification_time'] = snooze_until
+        st.toast(f"👍 已設定在 {minutes} 分鐘後提醒。")
+
 # --- 主程式 ---
-st.set_page_config(page_title="國考訂正追蹤器 v5.0", layout="wide", page_icon="✍️")
+st.set_page_config(page_title="國考訂正追蹤器 v5.1", layout="wide", page_icon="✍️")
 initialize_app_state()
 
-# 在程式開始時只嘗試連線一次
-if st.session_state.gsheet_client is None:
+if 'gsheet_client' not in st.session_state or st.session_state.gsheet_client is None:
     client = connect_to_gsheet()
     if client:
         st.session_state.gsheet_client = client
         st.session_state.gsheet_connection_status = "✅ 已同步雲端"
     else:
         st.session_state.gsheet_connection_status = "⚠️ 無法同步歷史紀錄"
-
 gs_client = st.session_state.gsheet_client
 
-# 登入畫面邏輯
 if not st.session_state.logged_in_user:
     st.title("歡迎使用國考高效訂正追蹤器")
     st.header("請選擇或建立您的使用者名稱")
-    
-    user_list = ["kudi68"] # 預設值
+    user_list = ["kudi68"]
     if gs_client:
-        loaded = load_users(gs_client)
-        if loaded is not None:
-            user_list = loaded
-
+        loaded_users = load_users(gs_client)
+        if loaded_users is not None:
+            user_list = loaded_users
     selected_user = st.selectbox("選擇您的使用者名稱：", user_list)
     if st.button("登入", type="primary"):
         st.session_state.logged_in_user = selected_user
         st.rerun()
-
     with st.expander("或者，建立新使用者"):
         if not gs_client:
             st.warning("無法連接雲端，暫時無法建立新使用者。")
@@ -159,35 +190,84 @@ if not st.session_state.logged_in_user:
                     if add_user(gs_client, new_user):
                         st.session_state.logged_in_user = new_user
                         st.success(f"使用者 '{new_user}' 建立成功！")
-                        time.sleep(1)
-                        st.rerun()
-                # ... 其他使用者檢查 ...
-
-# 主應用程式畫面 (登入後)
+                        time.sleep(1); st.rerun()
+                elif new_user in user_list: st.warning("此使用者名稱已存在。")
+                else: st.warning("請輸入有效的使用者名稱。")
 else:
+    # --- 主應用程式畫面 (登入後) ---
     with st.sidebar:
         st.header(f"👋 {st.session_state.logged_in_user}")
-        st.info(st.session_state.gsheet_connection_status) # 顯示連線狀態
+        st.info(st.session_state.gsheet_connection_status)
         if st.button("登出"):
+            client = st.session_state.gsheet_client
+            status = st.session_state.gsheet_connection_status
             st.session_state.clear()
+            st.session_state.gsheet_client = client
+            st.session_state.gsheet_connection_status = status
             st.rerun()
         st.divider()
-        # ... 其他側邊欄設定 ...
+        st.header("⚙️ 初始設定")
+        disabled_state = st.session_state.studying or st.session_state.confirming_finish
+        st.session_state.year = st.selectbox("考卷年份", [str(y) for y in range(109, 115)], index=5, disabled=disabled_state)
+        st.session_state.paper_type_init = st.selectbox("起始試卷別", ["醫學一", "醫學二"], disabled=disabled_state)
+        st.divider()
+        st.header("⏱️ 提醒設定")
+        st.session_state.initial_timeout = st.number_input("首次超時提醒 (秒)", min_value=10, value=120, step=5)
+        st.session_state.snooze_interval = st.number_input("後續提醒間隔 (秒)", min_value=10, value=60, step=5)
 
-    # 主畫面路由
+    # --- 主畫面路由 ---
     if st.session_state.studying:
-        # 訂正中的 UI
-        pass
+        main_col, stats_col = st.columns([2, 1.2])
+        with main_col:
+            st.header("📝 訂正進行中")
+            st.subheader(f"目前試卷：**{st.session_state.year} 年 - {st.session_state.paper_type}**")
+            with st.form(key='question_form'):
+                q_num_input = st.number_input("輸入題號 (1-100)", min_value=1, max_value=100, step=1, key="q_num_input")
+                submitted = st.form_submit_button("✔️ 確認", use_container_width=True)
+            if submitted:
+                if st.session_state.current_question:
+                    end_time = datetime.now()
+                    duration_sec = (end_time - st.session_state.current_question['start_time'] - st.session_state.total_paused_duration).total_seconds()
+                    st.session_state.records.append({
+                        "年份": st.session_state.year, "試卷別": st.session_state.paper_type,
+                        "題號": st.session_state.current_question['q_num'], "科目": get_subject(st.session_state.paper_type, st.session_state.current_question['q_num']),
+                        "耗時(秒)": int(duration_sec), "是否超時": duration_sec > st.session_state.initial_timeout
+                    })
+                st.session_state.current_question = {"q_num": q_num_input, "start_time": datetime.now()}
+                st.session_state.is_paused = False
+                st.session_state.total_paused_duration = timedelta(0)
+                st.rerun()
+        with stats_col:
+            st.header("📊 即時狀態")
+            if st.session_state.current_question:
+                q_info = st.session_state.current_question
+                elapsed_seconds = (datetime.now() - q_info['start_time'] - st.session_state.total_paused_duration).total_seconds()
+                st.metric("即時訂正時間", format_time(elapsed_seconds))
+                st.metric(f"目前題號：{q_info['q_num']}", f"科目：{get_subject(st.session_state.paper_type, q_info['q_num'])}")
+                st.markdown("---"); st.write("**延後提醒**")
+                snooze_cols = st.columns(3)
+                snooze_cols[0].button("1分鐘", on_click=snooze, args=(1,), use_container_width=True)
+                snooze_cols[1].button("2分鐘", on_click=snooze, args=(2,), use_container_width=True)
+                snooze_cols[2].button("5分鐘", on_click=snooze, args=(5,), use_container_width=True)
+            else:
+                st.info("請輸入第一題題號，點擊「✔️ 確認」後開始計時。")
+
     elif st.session_state.finished or st.session_state.viewing_report or st.session_state.confirming_finish:
-        # 報告頁面的 UI
         history_df = pd.DataFrame()
         if gs_client:
             history_df = load_history_from_gsheet(gs_client, st.session_state.logged_in_user)
         render_report_page(history_df, is_connected=(gs_client is not None))
     else:
-        # 歡迎畫面的 UI
         st.title(f"歡迎回來, {st.session_state.logged_in_user}!")
+        st.header("準備好開始下一次的訂正了嗎？")
         if st.button("🚀 開始新一次訂正", type="primary", use_container_width=True):
-            # ... 開始訂正的狀態重設 ...
+            st.session_state.studying = True
+            st.session_state.finished = False
+            st.session_state.records = []
+            st.session_state.current_question = None
+            st.session_state.paper_type = st.session_state.paper_type_init
             st.rerun()
 
+    if st.session_state.studying and st.session_state.current_question and not st.session_state.is_paused:
+        time.sleep(1)
+        st.rerun()
