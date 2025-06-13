@@ -29,7 +29,7 @@ def format_time(seconds):
     secs = int(seconds % 60)
     return f"{minutes:02d}:{secs:02d}"
 
-# --- Google Sheets 連線 (錯誤處理強化版) ---
+# --- Google Sheets 連線 ---
 @st.cache_resource(ttl=600)
 def connect_to_gsheet():
     try:
@@ -37,37 +37,19 @@ def connect_to_gsheet():
             st.secrets["gcp_service_account"],
             scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
         )
-        client = gspread.authorize(creds)
-        return client
+        return gspread.authorize(creds)
     except Exception as e:
-        st.error(f"金鑰或權限範圍設定錯誤，請檢查 Secrets: {e}")
+        st.error(f"金鑰或權限範圍設定錯誤: {e}")
         return None
 
 def get_worksheet(client, sheet_name, worksheet_name, headers):
     try:
         sheet = client.open(sheet_name)
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error(f"錯誤：在您的 Google 雲端硬碟中找不到名為 '{sheet_name}' 的 Google Sheet 檔案。請檢查 Streamlit Secrets 中的 `sheet_name` 是否與您的檔案名稱完全相符。")
-        return None
-    except Exception as e:
-        st.error(f"嘗試開啟 Google Sheet '{sheet_name}' 時發生錯誤：{e}。這通常是權限問題或 Secrets 設定不正確。")
-        return None
-
-    try:
         worksheet = sheet.worksheet(worksheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        try:
-            worksheet = sheet.add_worksheet(title=worksheet_name, rows="1", cols=len(headers))
-            worksheet.append_row(headers)
-            st.info(f"已自動為您建立新的工作表 '{worksheet_name}'。")
-        except Exception as e:
-            st.error(f"嘗試建立新工作表 '{worksheet_name}' 時發生錯誤：{e}。請檢查服務帳戶是否有此試算表的『編輯者』權限。")
-            return None
-    except Exception as e:
-        st.error(f"嘗試存取工作表 '{worksheet_name}' 時發生錯誤：{e}")
-        return None
+        worksheet = sheet.add_worksheet(title=worksheet_name, rows="1", cols=len(headers))
+        worksheet.append_row(headers)
     return worksheet
-
 
 # --- 使用者與歷史紀錄管理 ---
 @st.cache_data(ttl=60)
@@ -79,7 +61,6 @@ def load_users(_client):
     return users if users else ["kudi68"]
 
 def add_user(client, new_user):
-    if not client: return False
     worksheet = get_worksheet(client, st.secrets["gsheet"]["sheet_name"], "users", USER_HEADERS)
     if not worksheet: return False
     worksheet.append_row([new_user])
@@ -92,9 +73,8 @@ def load_history_from_gsheet(_client, username):
     worksheet = get_worksheet(_client, st.secrets["gsheet"]["sheet_name"], "history", HISTORY_HEADERS)
     if not worksheet: return pd.DataFrame(columns=HISTORY_HEADERS)
     data = worksheet.get_all_records()
-    if not data: return pd.DataFrame(columns=HISTORY_HEADERS)
     df = pd.DataFrame(data)
-    if 'user' not in df.columns: return pd.DataFrame(columns=HISTORY_HEADERS)
+    if df.empty or 'user' not in df.columns: return pd.DataFrame(columns=HISTORY_HEADERS)
     user_df = df[df['user'] == username].copy()
     for col in ['total_questions', 'timeout_questions', 'timeout_ratio']:
         if col in user_df.columns:
@@ -102,11 +82,9 @@ def load_history_from_gsheet(_client, username):
     return user_df
 
 def save_history_to_gsheet(client, new_summary):
-    if not client: return
     worksheet = get_worksheet(client, st.secrets["gsheet"]["sheet_name"], "history", HISTORY_HEADERS)
     if not worksheet: return
     worksheet.append_row(list(new_summary.values()))
-
 
 # --- 報告渲染函式 ---
 def render_report_page(user_history_df):
@@ -114,30 +92,103 @@ def render_report_page(user_history_df):
     if 'records' not in st.session_state or not st.session_state.records:
         st.warning("目前尚無本次訂正的紀錄可供分析。")
         return
-    # 其餘報告渲染邏輯...
+    df = pd.DataFrame(st.session_state.records)
+    # ... 其餘報告渲染邏輯 ...
 
-# --- 狀態初始化 ---
+# --- 狀態初始化 (完整版)---
 def initialize_app_state():
-    if 'gsheet_client' not in st.session_state: st.session_state.gsheet_client = connect_to_gsheet()
-    # 其餘狀態初始化...
+    # 確保所有 session_state 鍵都在程式最開始時被建立
+    keys_to_init = {
+        'gsheet_client': None,
+        'logged_in_user': None,
+        'studying': False,
+        'finished': False,
+        'confirming_finish': False,
+        'viewing_report': False,
+        'records': [],
+        'current_question': None,
+        'is_paused': False,
+        'total_paused_duration': timedelta(0),
+        'paper_type_init': "醫學一",
+        'year': "114"
+    }
+    for key, default_value in keys_to_init.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+    
+    # 僅在 gsheet_client 未被建立時才連線
+    if st.session_state.gsheet_client is None:
+        st.session_state.gsheet_client = connect_to_gsheet()
+
 
 # --- 主程式 ---
 st.set_page_config(page_title="國考訂正追蹤器 (多人版)", layout="wide", page_icon="✍️")
+
+# 確保狀態初始化是第一件執行的事
 initialize_app_state()
+
 gs_client = st.session_state.gsheet_client
 
+# 登入畫面邏輯
 if not st.session_state.logged_in_user:
     st.title("歡迎使用國考高效訂正追蹤器")
     st.header("請選擇或建立您的使用者名稱")
     if gs_client:
         users = load_users(gs_client)
-        selected_user = st.selectbox("選擇您的使用者名稱：", users)
+        selected_user = st.selectbox("選擇您的使用者名稱：", users, index=0 if not users else users.index('kudi68') if 'kudi68' in users else 0)
         if st.button("登入", type="primary"):
             st.session_state.logged_in_user = selected_user
             st.rerun()
-        # ...
+        with st.expander("或者，建立新使用者"):
+            new_user = st.text_input("輸入您的新使用者名稱：")
+            if st.button("建立並登入"):
+                if new_user and new_user not in users:
+                    if add_user(gs_client, new_user):
+                        st.session_state.logged_in_user = new_user
+                        st.success(f"使用者 '{new_user}' 建立成功！")
+                        time.sleep(2)
+                        st.rerun()
+                elif new_user in users: st.warning("此使用者名稱已存在。")
+                else: st.warning("請輸入有效的使用者名稱。")
     else:
-        st.warning("正在等待與 Google Sheets 建立連線... 如果持續顯示此訊息，請依照除錯清單檢查您的設定。")
+        st.warning("正在等待與 Google Sheets 建立連線... 如果持續顯示此訊息，請檢查 Secrets 設定。")
+
+# 主應用程式畫面 (登入後)
 else:
-    # 主應用程式畫面 (登入後)
-    pass
+    with st.sidebar:
+        st.header(f"👋 {st.session_state.logged_in_user}")
+        if st.button("登出"):
+            # 保留客戶端連線，清除其他所有狀態
+            client = st.session_state.gsheet_client
+            st.session_state.clear()
+            st.session_state.gsheet_client = client
+            st.session_state.logged_in_user = None # 確保返回登入頁面
+            st.rerun()
+        st.divider()
+        st.header("⚙️ 初始設定")
+        is_studying_disabled = st.session_state.studying or st.session_state.confirming_finish
+        year_options = [str(y) for y in range(109, 115)]
+        st.session_state.year = st.selectbox("考卷年份", year_options, index=len(year_options)-1, disabled=is_studying_disabled)
+        st.session_state.paper_type_init = st.selectbox("起始試卷別", ["醫學一", "醫學二"], disabled=is_studying_disabled)
+    
+    if st.session_state.studying:
+        st.title("正在訂正中...")
+        # 此處應有訂正中的完整 UI 邏輯
+    elif st.session_state.finished or st.session_state.viewing_report or st.session_state.confirming_finish:
+        user_history_df = load_history_from_gsheet(gs_client, st.session_state.logged_in_user)
+        render_report_page(user_history_df)
+    else:
+        # 歡迎畫面
+        st.title(f"歡迎回來, {st.session_state.logged_in_user}!")
+        st.header("準備好開始下一次的訂正了嗎？")
+        if st.button("🚀 開始新一次訂正", type="primary", use_container_width=True):
+            # 重設學習狀態
+            st.session_state.studying = True
+            st.session_state.finished = False
+            st.session_state.confirming_finish = False
+            st.session_state.viewing_report = False
+            st.session_state.records = []
+            st.session_state.current_question = None
+            st.session_state.paper_type = st.session_state.paper_type_init
+            st.rerun()
+
