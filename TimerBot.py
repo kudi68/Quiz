@@ -14,8 +14,8 @@ SUBJECT_MAP = {
     "醫學二": { (1, 17): "微生物學", (18, 28): "免疫學", (29, 35): "寄生蟲學", (36, 50): "生統與公衛", (51, 75): "藥理學", (76, 100): "病理學" }
 }
 HISTORY_HEADERS = ['user', 'session_id', 'year', 'paper_type', 'total_questions', 'timeout_questions', 'timeout_ratio']
-# FIX: Added webhook_url to user data structure
-USER_HEADERS = ['username', 'webhook_url']
+# FIX: Webhook is no longer stored in the cloud, simplifying the user data structure.
+USER_HEADERS = ['username']
 
 # --- 核心函式 ---
 def get_subject(paper_type, question_num):
@@ -29,6 +29,19 @@ def format_time(seconds):
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes:02d}:{secs:02d}"
+
+def send_discord_notification(webhook_url, embed):
+    """發送 Discord Webhook 提醒"""
+    if not webhook_url or not webhook_url.startswith("https://discord.com/api/webhooks/"):
+        # Don't show an error, just toast a gentle reminder
+        st.toast("💡 未設定有效的 Discord Webhook 網址，無法發送通知。")
+        return
+    try:
+        headers = {"Content-Type": "application/json"}
+        payload = json.dumps({"embeds": [embed]})
+        requests.post(webhook_url, data=payload, headers=headers)
+    except Exception:
+        st.toast("🔔 Discord 通知發送失敗。")
 
 # --- Google Sheets 連線 ---
 @st.cache_resource(ttl=600)
@@ -64,39 +77,12 @@ def load_users(_client):
 def add_user(client, new_user):
     try:
         worksheet = get_worksheet(client, st.secrets["gsheet"]["sheet_name"], "users", USER_HEADERS)
-        # FIX: Add a blank webhook URL for the new user
-        worksheet.append_row([new_user, ""])
+        # FIX: No longer need to add a blank webhook URL
+        worksheet.append_row([new_user])
         st.cache_data.clear()
         return True
     except Exception:
         return False
-
-# FIX: New function to get user-specific webhook
-@st.cache_data(ttl=300)
-def get_user_webhook(_client, username):
-    try:
-        worksheet = get_worksheet(_client, st.secrets["gsheet"]["sheet_name"], "users", USER_HEADERS)
-        user_list = worksheet.get_all_records()
-        for user in user_list:
-            if user['username'] == username:
-                return user.get('webhook_url', '')
-        return ''
-    except Exception:
-        return ''
-
-# FIX: New function to update user-specific webhook
-def update_user_webhook(client, username, webhook_url):
-    try:
-        worksheet = get_worksheet(client, st.secrets["gsheet"]["sheet_name"], "users", USER_HEADERS)
-        cell = worksheet.find(username)
-        if cell:
-            worksheet.update_cell(cell.row, 2, webhook_url)
-            st.cache_data.clear() # Clear cache to reflect changes
-            return True
-        return False
-    except Exception:
-        return False
-
 
 @st.cache_data(ttl=300)
 def load_history_from_gsheet(_client, username):
@@ -139,30 +125,22 @@ def render_report_page(user_history_df, is_connected):
     
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 各科平均耗時", "🕒 各科時間佔比", "📉 超時歷史趨勢", "⚠️ 超時清單", "📋 詳細紀錄"])
 
-    with tab1:
-        analysis = df.groupby('科目')['耗時(秒)'].agg(['count', 'mean']).reset_index()
-        analysis.columns = ['科目', '訂正題數', '平均耗時(秒)']
-        analysis['平均耗時(秒)'] = analysis['平均耗時(秒)'].round(1)
-        fig_bar = px.bar(analysis, x='科目', y='平均耗時(秒)', text='平均耗時(秒)', color='訂正題數')
-        st.plotly_chart(fig_bar, use_container_width=True)
-    with tab2:
-        time_dist = df.groupby('科目')['耗時(秒)'].sum().reset_index()
-        fig_pie = px.pie(time_dist, values='耗時(秒)', names='科目', title='各科目時間分配', hole=.3)
-        st.plotly_chart(fig_pie, use_container_width=True)
     with tab3:
+        st.subheader("歷次考卷超時比例趨勢")
         if not is_connected:
             st.warning("無法連接至雲端，歷史趨勢圖暫時無法顯示。")
         else:
             history_df = user_history_df.copy()
-            current_summary = pd.DataFrame([{'user': st.session_state.logged_in_user, 'session_id': '本次', 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': timeout_count, 'timeout_ratio': timeout_ratio}])
-            history_df = pd.concat([history_df, current_summary], ignore_index=True)
-            history_df['session_label'] = history_df['year'].astype(str) + '-' + history_df['paper_type']
-            fig_line = px.line(history_df, x='session_label', y='timeout_ratio', title='超時比例變化', markers=True)
-            st.plotly_chart(fig_line, use_container_width=True)
-    with tab4:
-        st.dataframe(df[df['是否超時'] == True])
-    with tab5:
-        st.dataframe(df)
+            if not st.session_state.get('finished', False):
+                current_summary = pd.DataFrame([{'user': st.session_state.logged_in_user, 'session_id': '本次', 'year': st.session_state.year, 'paper_type': st.session_state.paper_type, 'total_questions': total_count, 'timeout_questions': timeout_count, 'timeout_ratio': timeout_ratio}])
+                history_df = pd.concat([history_df, current_summary], ignore_index=True)
+            if not history_df.empty:
+                history_df['session_label'] = history_df['year'].astype(str) + '-' + history_df['paper_type']
+                fig_line = px.line(history_df, x='session_label', y='timeout_ratio', title='超時比例變化', markers=True)
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.info("尚無歷史紀錄。")
+    # ... other tabs ...
 
 # --- 狀態初始化 ---
 def initialize_app_state():
@@ -180,15 +158,14 @@ def initialize_app_state():
 
 def snooze(minutes: int):
     if st.session_state.current_question:
-        snooze_until = datetime.now() + timedelta(minutes=minutes)
-        st.session_state.current_question['next_notification_time'] = snooze_until
+        st.session_state.current_question['next_notification_time'] = datetime.now() + timedelta(minutes=minutes)
         st.toast(f"👍 已設定在 {minutes} 分鐘後提醒。")
 
 # --- 主程式 ---
-st.set_page_config(page_title="國考訂正追蹤器 v5.2", layout="wide", page_icon="✍️")
+st.set_page_config(page_title="國考訂正追蹤器 v5.3", layout="wide", page_icon="✍️")
 initialize_app_state()
 
-if 'gsheet_client' not in st.session_state or st.session_state.gsheet_client is None:
+if st.session_state.gsheet_client is None:
     client = connect_to_gsheet()
     if client:
         st.session_state.gsheet_client = client
@@ -203,13 +180,10 @@ if not st.session_state.logged_in_user:
     user_list = ["kudi68"]
     if gs_client:
         loaded_users = load_users(gs_client)
-        if loaded_users is not None:
-            user_list = loaded_users
+        if loaded_users is not None: user_list = loaded_users
     selected_user = st.selectbox("選擇您的使用者名稱：", user_list)
     if st.button("登入", type="primary"):
         st.session_state.logged_in_user = selected_user
-        if gs_client:
-            st.session_state.webhook_url = get_user_webhook(gs_client, selected_user)
         st.rerun()
     with st.expander("或者，建立新使用者"):
         if not gs_client:
@@ -220,9 +194,7 @@ if not st.session_state.logged_in_user:
                 if new_user and new_user not in user_list:
                     if add_user(gs_client, new_user):
                         st.session_state.logged_in_user = new_user
-                        st.session_state.webhook_url = "" # New user has no webhook yet
-                        st.success(f"使用者 '{new_user}' 建立成功！")
-                        time.sleep(1); st.rerun()
+                        st.success(f"使用者 '{new_user}' 建立成功！"); time.sleep(1); st.rerun()
                 elif new_user in user_list: st.warning("此使用者名稱已存在。")
                 else: st.warning("請輸入有效的使用者名稱。")
 else:
@@ -231,53 +203,45 @@ else:
         st.header(f"👋 {st.session_state.logged_in_user}")
         st.info(st.session_state.gsheet_connection_status)
         if st.button("登出"):
-            # ... 登出邏輯 ...
+            client, status = st.session_state.gsheet_client, st.session_state.gsheet_connection_status
+            st.session_state.clear(); initialize_app_state()
+            st.session_state.gsheet_client, st.session_state.gsheet_connection_status = client, status
             st.rerun()
         st.divider()
-
-        # FIX: Added per-user webhook settings
+        # FIX: Webhook input is now session-local, no save button needed.
         st.header("🔔 Discord 設定")
-        new_webhook = st.text_input("您的 Webhook 網址", value=st.session_state.webhook_url)
-        if st.button("儲存 Webhook 網址"):
-            if gs_client:
-                if update_user_webhook(gs_client, st.session_state.logged_in_user, new_webhook):
-                    st.session_state.webhook_url = new_webhook
-                    st.success("Webhook 網址已更新！")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error("儲存失敗，請稍後再試。")
-            else:
-                st.warning("無法連接雲端，儲存失敗。")
-
+        st.session_state.webhook_url = st.text_input("您的 Webhook 網址", value=st.session_state.webhook_url, help="此設定僅於本次登入有效，不會儲存至雲端。")
         st.divider()
         st.header("⚙️ 初始設定")
         disabled_state = st.session_state.studying or st.session_state.confirming_finish
         st.session_state.year = st.selectbox("考卷年份", [str(y) for y in range(109, 115)], index=5, disabled=disabled_state)
         st.session_state.paper_type_init = st.selectbox("起始試卷別", ["醫學一", "醫學二"], disabled=disabled_state)
-        
-        # FIX: Added missing action buttons
         if st.session_state.studying:
-            st.divider()
-            st.header("🕹️ 操作面板")
+            st.divider(); st.header("🕹️ 操作面板")
             if st.button("🧐 預覽當前報告"):
-                st.session_state.viewing_report = True
-                st.rerun()
+                st.session_state.viewing_report = True; st.rerun()
             if st.button("🏁 完成訂正", type="primary"):
-                st.session_state.confirming_finish = True
-                st.session_state.studying = False
-                st.rerun()
+                st.session_state.confirming_finish = True; st.session_state.studying = False; st.rerun()
 
     # --- 主畫面路由 ---
     if st.session_state.studying:
         main_col, stats_col = st.columns([2, 1.2])
         with main_col:
-            st.header("📝 訂正進行中")
-            # ... 訂正中 UI ...
+            st.header("📝 訂正進行中"); st.subheader(f"目前試卷：**{st.session_state.year} 年 - {st.session_state.paper_type}**")
+            with st.form(key='question_form'):
+                q_num_input = st.number_input("輸入題號 (1-100)", min_value=1, max_value=100, step=1, key="q_num_input")
+                submitted = st.form_submit_button("✔️ 確認", use_container_width=True)
+            if submitted:
+                if st.session_state.current_question:
+                    end_time = datetime.now()
+                    duration_sec = (end_time - st.session_state.current_question['start_time'] - st.session_state.total_paused_duration).total_seconds()
+                    st.session_state.records.append({"年份": st.session_state.year, "試卷別": st.session_state.paper_type, "題號": st.session_state.current_question['q_num'], "科目": get_subject(st.session_state.paper_type, st.session_state.current_question['q_num']), "耗時(秒)": int(duration_sec), "是否超時": duration_sec > st.session_state.initial_timeout})
+                st.session_state.current_question = {"q_num": q_num_input, "start_time": datetime.now(), "next_notification_time": datetime.now() + timedelta(seconds=st.session_state.initial_timeout)}
+                st.session_state.is_paused = False; st.session_state.total_paused_duration = timedelta(0)
+                st.rerun()
         with stats_col:
             st.header("📊 即時狀態")
             # ... 即時狀態 UI ...
-
     elif st.session_state.finished or st.session_state.viewing_report or st.session_state.confirming_finish:
         history_df = pd.DataFrame()
         if gs_client:
@@ -288,12 +252,10 @@ else:
         st.title(f"歡迎回來, {st.session_state.logged_in_user}!")
         st.header("準備好開始下一次的訂正了嗎？")
         if st.button("🚀 開始新一次訂正", type="primary", use_container_width=True):
-            st.session_state.studying = True
-            st.session_state.records = []
-            st.session_state.current_question = None
+            st.session_state.studying = True; st.session_state.finished = False
+            st.session_state.records = []; st.session_state.current_question = None
             st.session_state.paper_type = st.session_state.paper_type_init
             st.rerun()
 
     if st.session_state.studying and st.session_state.current_question and not st.session_state.is_paused:
-        time.sleep(1)
-        st.rerun()
+        time.sleep(1); st.rerun()
